@@ -16,7 +16,7 @@ import type { Message } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, SessionLogOffset, SessionSeq } from './types.ts'
 import type { TypertLookup } from '@deepseek-ai/dsh-typert-protocol'
 import type { CreateSessionOptions, EpochHeader, PluginRecord, PluginRecordMap, PluginRecordType, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventInput, SessionEventMap, SessionEventType, SessionHeader, SessionId, SessionSeedEventState, SurfaceIntent, SurfaceEventType } from './types.ts'
-import { SurfaceManager, validateSessionEventData, validateSurfaceMetadata } from './surface.ts'
+import { repairDerivedHistory, SurfaceManager, validateSessionEventData, validateSurfaceMetadata } from './surface.ts'
 import type { SessionSurface, SessionMessageProjection } from './surface.ts'
 import { foldRequestHeader } from './request-header.ts'
 import { ToolHistoryProjection } from './tool-history.ts'
@@ -31,7 +31,7 @@ export type { SessionPreparationOptions } from './preparation.ts'
 export type { AssistantMessage, DeveloperMessage, SystemMessage, ToolResultMessage, UserMessage } from '@deepseek-ai/dsh-llm'
 export { interruptedTurnClosers, ToolCallRecovery, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from './repair.ts'
 export type { SessionSurface, SurfaceFoldReplacement, SurfaceFoldResult, SessionMessageProjection, SessionMessageProjectionContext } from './surface.ts'
-export { deriveEventMessage, foldSurface, isAppendSurfaceEvent, isReplacementSurfaceEvent, isSurfaceEvent, isSurfaceEligibleType } from './surface.ts'
+export { deriveEventMessage, foldSurface, isAppendSurfaceEvent, isReplacementSurfaceEvent, isSurfaceEvent, isSurfaceEligibleType, repairDerivedHistory } from './surface.ts'
 export { canonicalHeader, foldRequestHeader, headerEquals } from './request-header.ts'
 export { KNOWN_SESSION_EVENT_TYPES } from './known-event-types.ts'
 
@@ -1074,7 +1074,12 @@ export class Session {
    * already holds); the `Message` objects in it are SHARED and **deep-frozen**.
    * Unchanged content reuses frozen event data; projected blocks are frozen
    * derived copies. Consumers cannot mutate the log through either form.
-   * @returns a fresh array of the shared, frozen derived history.
+   * The returned snapshot additionally closes every tool exchange
+   * ({@link repairDerivedHistory}): a message surface order placed inside an
+   * open tool call/result exchange defers past the exchange, so provider wire
+   * order never interleaves non-tool messages between a tool call and its
+   * result.
+   * @returns a fresh array of the shared, frozen, wire-legal derived history.
    */
   deriveMessages(): Message[] {
     const surface = this.surface
@@ -1096,7 +1101,7 @@ export class Session {
       if (msg) this.derived.push(msg)
     }
     this.derivedNodes = nodes.length
-    return [...this.derived]
+    return repairDerivedHistory(this.derived)
   }
 
   /**

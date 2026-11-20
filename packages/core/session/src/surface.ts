@@ -8,7 +8,7 @@
  * @module @deepseek-ai/dsh-session/surface
  */
 
-import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { Message, ToolCallId, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { SessionLogOffset, SessionSeq } from './types.ts'
 import { KNOWN_SESSION_EVENT_TYPES, MESSAGE_PROJECTION_EVENT_TYPES } from './known-event-types.ts'
 import type {
@@ -149,6 +149,66 @@ export function deriveEventMessage(
       // no message. Merge-extensible union: no assertNever here.
       return null
   }
+}
+
+/**
+ * Repair the provider-wire order of a derived history snapshot without
+ * changing membership or message identity.
+ *
+ * OpenAI-compatible providers reject a `tool` message that does not
+ * immediately answer a `tool-call` on the preceding assistant message
+ * (observed in the wild, with a notice appended mid-exchange, as
+ * `400 messages with role 'tool' must be a response to a preceeding
+ * message with 'tool_calls'`). Surface append order alone cannot guarantee
+ * legality: any message appended while a tool executes lands between the
+ * assistant tool-call and its `tool/result`.
+ *
+ * This pass correlates assistant `tool-call` blocks with `tool` results and
+ * closes each exchange contiguously. Messages surface order placed inside an
+ * OPEN exchange — plugin notices, user replies — defer until the exchange
+ * closes (its last recorded result), keeping their relative order; with no
+ * call unanswered they pass through in place. A new assistant message first
+ * emits everything an earlier (possibly truncated) exchange buffered, so a
+ * fresh assistant is never buried behind stale interleave. A message already
+ * in a legal position is never moved. The input array is not mutated and its
+ * message objects are returned by reference.
+ * @param messages - derived history in surface order.
+ * @returns a fresh array with tool exchanges closed contiguously.
+ */
+export function repairDerivedHistory(messages: readonly Message[]): Message[] {
+  const repaired: Message[] = []
+  const pending: Message[] = []
+  const unanswered = new Set<ToolCallId>()
+  for (const message of messages) {
+    if (message.role === 'assistant') {
+      // A new assistant boundary always flushes buffered notices first, so a
+      // fresh assistant never gets buried behind stale interleave from an
+      // earlier (possibly truncated) exchange.
+      if (pending.length > 0) {
+        repaired.push(...pending)
+        pending.length = 0
+      }
+      repaired.push(message)
+      for (const block of message.content) if (block.type === 'tool-call') unanswered.add(block.id)
+      continue
+    }
+    if (message.role === 'tool' && unanswered.has(message.toolCallId)) {
+      unanswered.delete(message.toolCallId)
+      repaired.push(message)
+      if (unanswered.size === 0 && pending.length > 0) {
+        repaired.push(...pending)
+        pending.length = 0
+      }
+      continue
+    }
+    if (unanswered.size > 0) {
+      pending.push(message)
+      continue
+    }
+    repaired.push(message)
+  }
+  if (pending.length > 0) repaired.push(...pending)
+  return repaired
 }
 
 /** Whether a payload field is a JSON object rather than an array or scalar. */
